@@ -452,24 +452,16 @@ def _max_op(a: Float32, b: Float32) -> Float32:
 
 
 @cute.jit
-def compute_local_amax(x: cute.Tensor) -> Float32:
-    """Compute max(abs(x)) over all elements of a register-resident tensor."""
-    local_max = Float32(0.0)
-    for i in cutlass.range_constexpr(cute.size(x)):
-        val = Float32(x[i])
-        val = -val if val < 0.0 else val
+def write_max_logit(row_max: cute.Tensor, mMaxLogit: cute.Tensor) -> None:
+    """Reduce per-row max logits and atomically update mMaxLogit."""
+    local_max = Float32(-Float32.inf)
+    for i in cutlass.range_constexpr(cute.size(row_max)):
+        val = Float32(row_max[i])
         local_max = val if val > local_max else local_max
-    return local_max
-
-
-@cute.jit
-def write_max_norm(acc_O: cute.Tensor, mMaxNorm: cute.Tensor) -> None:
-    """Compute amax of acc_O and atomically update mMaxNorm via warp reduction."""
-    local_max = compute_local_amax(acc_O)
     local_max = warp_reduce(local_max, _max_op)
     lane_id = cute.arch.thread_idx()[0] % cute.arch.WARP_SIZE
     if lane_id == 0:
-        atomic_max_fp32(local_max, mMaxNorm.iterator)
+        atomic_max_fp32(local_max, mMaxLogit.iterator)
 
 
 @dsl_user_op

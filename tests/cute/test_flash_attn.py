@@ -1731,22 +1731,29 @@ def test_flash_attn_max_norm(
     k = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype)
     v = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype)
 
-    out, lse, max_norm = flash_attn_func(
+    out, lse, max_logit = flash_attn_func(
         q, k, v, causal=causal, return_lse=True, return_max_norm=True,
     )
 
     if not USE_FAKE_TENSOR:
-        assert max_norm is not None
-        assert max_norm.shape == (1,)
-        assert max_norm.dtype == torch.float32
+        assert max_logit is not None
+        assert max_logit.shape == (1,)
+        assert max_logit.dtype == torch.float32
 
-        max_norm_ref = torch.abs(out.float()).max()
-        print(f"max_norm={max_norm.item():.6f}, max_norm_ref={max_norm_ref.item():.6f}")
-        # Kernel computes amax from float32 registers before dtype conversion;
-        # reference computes from the already-converted output. The difference
-        # is bounded by dtype quantization error.
-        tol = 1e-3 if dtype == torch.float16 else 5e-3
-        torch.testing.assert_close(max_norm, max_norm_ref.unsqueeze(0), rtol=tol, atol=tol)
+        # Reference: compute max(QK^T) directly (unscaled, matching kernel row_max)
+        q_f = q.float()
+        k_f = repeat(k.float(), "b s h d -> b s (h g) d", g=nheads // nheads_kv)
+        scores = torch.einsum("bqhd,bkhd->bhqk", q_f, k_f)
+        if causal:
+            mask = torch.triu(torch.ones(seqlen_q, seqlen_k, device=device, dtype=torch.bool), diagonal=seqlen_k - seqlen_q + 1)
+            scores.masked_fill_(mask, float("-inf"))
+        max_logit_ref = scores[scores != float("-inf")].max()
+        print(f"max_logit={max_logit.item():.6f}, max_logit_ref={max_logit_ref.item():.6f}")
+        # SM100 uses rescale_threshold optimization that makes row_max approximate.
+        # The kernel value is a lower bound of the true max logit, within ~10%.
+        assert max_logit.item() > 0, "max_logit should be positive for random data"
+        assert max_logit.item() <= max_logit_ref.item() * 1.01, "kernel should not exceed ref"
+        assert max_logit.item() >= max_logit_ref.item() * 0.85, "kernel should be within 15% of ref"
 
     # Also test that return_max_norm=False returns 2-tuple (backward compat)
     result = flash_attn_func(q, k, v, causal=causal, return_max_norm=False)

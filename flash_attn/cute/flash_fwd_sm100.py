@@ -2064,6 +2064,7 @@ class FlashAttentionForwardSm100:
                         sScale[
                             tidx + stage * self.m_block_size + self.q_stage * self.m_block_size
                         ] = softmax.row_max[0]
+                    # Note: max logit is written from correction warps (see correction_loop)
                     # pipeline_sm_stats.producer_commit_w_index(stage)
                     sm_stats_barrier.arrive_w_index(index=stage * 4 + warp_idx)
 
@@ -2419,7 +2420,6 @@ class FlashAttentionForwardSm100:
                         mO_cur,
                         gO_stage,
                         gmem_tiled_copy_O,
-                        self._mMaxNorm,
                     )
                     # Signal for the next work tile that O buffers in tmem are already read, so
                     # mma warp can write to them
@@ -2489,8 +2489,10 @@ class FlashAttentionForwardSm100:
                 for stage in cutlass.range_constexpr(self.q_stage):
                     m_tile_idx = (m_block * self.q_stage + stage) * self.cta_group_size + mma_tile_coord_v
                     row_sum, row_max, acc_O_mn_row_is_zero_or_nan = stats[stage]
-                    # if tidx == 0 and stage <= 1:
-                    #     cute.printf("row_sum = {}, row_max = {}, acc_O_mn_row_is_zero_or_nan = {}\n", row_sum, row_max, acc_O_mn_row_is_zero_or_nan)
+                    # Write max logit from correction warps
+                    if const_expr(self._mMaxNorm is not None and row_max is not None):
+                        if not acc_O_mn_row_is_zero_or_nan:
+                            utils.atomic_max_fp32(row_max, self._mMaxNorm.iterator)
                     LN2 = math.log(2.0)
                     lse = (
                         (row_max * softmax_scale_log2 + cute.math.log2(row_sum, fastmath=True)) * LN2
@@ -2591,7 +2593,6 @@ class FlashAttentionForwardSm100:
         mO_cur: Optional[cute.Tensor] = None,
         gO: Optional[cute.Tensor] = None,
         gmem_tiled_copy_O: Optional[cute.TiledCopy] = None,
-        mMaxNorm: Optional[cute.Tensor] = None,
     ):
         """Apply final scaling and transformation to attention output before writing to global memory.
 
@@ -2644,8 +2645,6 @@ class FlashAttentionForwardSm100:
         tOtO_t2r = thr_tmem_load.partition_S(tOtO_i[(None, None), None])
         tOsO_s2r = copy_utils.partition_D_position_independent(thr_tmem_load, tOsO_i[(None, None), None])
         tOcO_t2r = thr_tmem_load.partition_D(tOcO_i[(None, None), None])
-        if const_expr(mMaxNorm is not None):
-            amax_local = Float32(0.0)
         for i in cutlass.range(self.head_dim_v_padded // corr_tile_size, unroll_full=True):
             tOtO_t2r_i = tOtO_t2r[None, 0, 0, i]
             tOsO_r2s_i = tOsO_s2r[None, 0, 0, i]
@@ -2655,15 +2654,7 @@ class FlashAttentionForwardSm100:
                 tOrO_frg[j], tOrO_frg[j + 1] = cute.arch.mul_packed_f32x2(
                     (tOrO_frg[j], tOrO_frg[j + 1]), (scale, scale)
                 )
-            if const_expr(mMaxNorm is not None):
-                tile_max = utils.compute_local_amax(tOrO_frg)
-                amax_local = tile_max if tile_max > amax_local else amax_local
             copy_utils.cvt_copy(tiled_smem_store, tOrO_frg, tOsO_r2s_i)
-        if const_expr(mMaxNorm is not None):
-            amax_local = utils.warp_reduce(amax_local, utils._max_op)
-            lane_id = cute.arch.thread_idx()[0] % cute.arch.WARP_SIZE
-            if lane_id == 0:
-                utils.atomic_max_fp32(amax_local, mMaxNorm.iterator)
         cute.arch.fence_view_async_shared()
 
         if const_expr(self.use_correction_warps_for_epi):

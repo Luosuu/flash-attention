@@ -336,11 +336,7 @@ class FlashAttentionForwardBase:
         m_block: Int32,
         head_idx: Int32,
         batch_idx: Int32,
-        mMaxNorm: Optional[cute.Tensor] = None,
     ):
-        # Compute amax before dtype conversion (acc_O is still float32)
-        if const_expr(mMaxNorm is not None):
-            utils.write_max_norm(acc_O, mMaxNorm)
         # store acc_O
         rO = cute.make_fragment_like(acc_O, self.dtype)
         rO.store(acc_O.load().to(self.dtype))
@@ -1062,6 +1058,10 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         row_scale = softmax.finalize()
         softmax.rescale_O(acc_O, row_scale)
 
+        # Write max logit to global memory
+        if const_expr(self._mMaxNorm is not None):
+            utils.write_max_logit(softmax.row_max, self._mMaxNorm)
+
         # ///////////////////////////////////////////////////////////////////////////////
         # Epilogue
         # ///////////////////////////////////////////////////////////////////////////////
@@ -1081,7 +1081,6 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             m_block,
             num_head,
             batch_size,
-            self._mMaxNorm,
         )
 
     @cute.jit

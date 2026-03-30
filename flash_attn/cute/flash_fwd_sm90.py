@@ -1238,6 +1238,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             row_scale = softmax.finalize(sink_val=sink_val)
             softmax.rescale_O(acc_O, row_scale)
 
+            # Write max logit to global memory
+            if const_expr(self._mMaxNorm is not None):
+                utils.write_max_logit(softmax.row_max, self._mMaxNorm)
+
             # ///////////////////////////////////////////////////////////////////////////////
             # Epilogue
             # ///////////////////////////////////////////////////////////////////////////////
@@ -1255,7 +1259,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 m_block,
                 head_idx,
                 batch_idx,
-                self._mMaxNorm,
             )
 
             tile_scheduler.advance_to_next_work()

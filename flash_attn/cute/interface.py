@@ -447,7 +447,7 @@ def _flash_attn_fwd(
             raise ValueError("return_max_norm is not supported with paged KV cache (inference)")
         if pack_gqa:
             raise ValueError("return_max_norm is not supported with pack_gqa")
-    max_norm = torch.zeros(1, dtype=torch.float32, device=device) if return_max_norm else None
+    max_norm = torch.full((1,), float("-inf"), dtype=torch.float32, device=device) if return_max_norm else None
 
     dtype = torch2cute_dtype_map[q.dtype]
     use_block_sparsity = block_sparse_tensors is not None
@@ -634,7 +634,7 @@ def _flash_attn_fwd(
         intra_wg_overlap,
         requested_use_clc_scheduler,
         fa_logging.get_fa_log_level(),
-        max_norm is None or is_split_kv or pack_gqa,  # kernel receives max_norm?
+        max_norm is None or pack_gqa,  # kernel receives max_norm?
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
         (
@@ -664,8 +664,8 @@ def _flash_attn_fwd(
         else:
             lse_tensor = None
 
-        # Kernel computes max_norm only for non-split, non-pack_gqa paths
-        _kernel_max_norm = max_norm if (max_norm is not None and not is_split_kv and not pack_gqa) else None
+        # Kernel computes max logit only for non-pack_gqa paths
+        _kernel_max_norm = max_norm if (max_norm is not None and not pack_gqa) else None
         max_norm_tensor = (
             to_cute_tensor(_kernel_max_norm, assumed_align=4, leading_dim=0)
             if _kernel_max_norm is not None
@@ -823,7 +823,7 @@ def _flash_attn_fwd(
             learnable_sink,
             normalized_block_sparse_tensors[:4] if normalized_block_sparse_tensors is not None else None,
             aux_tensors,
-            max_norm if not is_split_kv and not pack_gqa else None,
+            max_norm if not pack_gqa else None,
         )
     if is_split_kv:
         _flash_attn_fwd_combine(
@@ -833,7 +833,6 @@ def _flash_attn_fwd(
             lse.transpose(-1, -2) if lse is not None else None,
             cu_seqlens_q,
             seqused_q,
-            max_norm=max_norm,
         )
     if return_max_norm:
         return out, lse, max_norm
@@ -1885,7 +1884,7 @@ def flash_attn_varlen_func(
 
 def _compile_fwd_combine(
     dtype, dtype_partial, head_dim, tile_m, k_block_size, log_max_splits,
-    has_cu_seqlens, has_seqused, has_lse, has_varlen_batch_idx, has_max_norm=False,
+    has_cu_seqlens, has_seqused, has_lse, has_varlen_batch_idx,
 ):
     """Compile fwd combine kernel using cute fake tensors (no real GPU tensors needed)."""
     sym = cute.sym_int
@@ -1930,13 +1929,11 @@ def _compile_fwd_combine(
     mNumSplitsDynamic = None  # Not parametrized in compile_key
     mVarlenBatchIdx = fake_tensor(Int32, (batch_for_1d,), divisibility=1) if has_varlen_batch_idx else None
     mSemaphore = None  # Not parametrized in compile_key
-    mMaxNorm = fake_tensor(Float32, (1,), divisibility=1) if has_max_norm else None
 
     return cute.compile(
         fa_combine,
         mO_partial, mLSE_partial, mO, mLSE,
         mCuSeqlens, mSeqused, mNumSplitsDynamic, mVarlenBatchIdx, mSemaphore,
-        mMaxNorm,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--enable-tvm-ffi",
     )
@@ -1952,7 +1949,6 @@ def _flash_attn_fwd_combine(
     num_splits_dynamic_ptr: Optional[torch.Tensor] = None,
     varlen_batch_idx: Optional[torch.Tensor] = None,
     semaphore_to_reset: Optional[torch.Tensor] = None,
-    max_norm: Optional[torch.Tensor] = None,
 ) -> None:
     """Forward combine kernel for split attention computation.
 
@@ -2021,7 +2017,6 @@ def _flash_attn_fwd_combine(
         seqused is not None,
         lse is not None,
         varlen_batch_idx is not None,
-        max_norm is not None,
     )
     if compile_key not in _flash_attn_fwd_combine.compile_cache:
         _flash_attn_fwd_combine.compile_cache[compile_key] = _compile_fwd_combine(
@@ -2031,7 +2026,7 @@ def _flash_attn_fwd_combine(
         _flash_attn_fwd_combine.compile_cache[compile_key](
             out_partial, lse_partial, out, lse,
             cu_seqlens, seqused, num_splits_dynamic_ptr, varlen_batch_idx,
-            semaphore_to_reset, max_norm,
+            semaphore_to_reset,
         )
 
 
