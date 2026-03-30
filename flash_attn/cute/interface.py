@@ -634,7 +634,7 @@ def _flash_attn_fwd(
         intra_wg_overlap,
         requested_use_clc_scheduler,
         fa_logging.get_fa_log_level(),
-        max_logit is None or pack_gqa,  # kernel receives max_logit?
+        max_logit is None or pack_gqa,  # True when kernel does NOT compute max_logit
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
         (

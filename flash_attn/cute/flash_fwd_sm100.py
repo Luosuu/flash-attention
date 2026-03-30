@@ -2489,6 +2489,8 @@ class FlashAttentionForwardSm100:
                 for stage in cutlass.range_constexpr(self.q_stage):
                     m_tile_idx = (m_block * self.q_stage + stage) * self.cta_group_size + mma_tile_coord_v
                     row_sum, row_max, acc_O_mn_row_is_zero_or_nan = stats[stage]
+                    # if tidx == 0 and stage <= 1:
+                    #     cute.printf("row_sum = {}, row_max = {}, acc_O_mn_row_is_zero_or_nan = {}\n", row_sum, row_max, acc_O_mn_row_is_zero_or_nan)
                     # Write max logit from correction warps
                     if const_expr(self._mMaxLogit is not None and row_max is not None):
                         if not acc_O_mn_row_is_zero_or_nan:
