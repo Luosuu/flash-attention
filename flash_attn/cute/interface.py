@@ -313,7 +313,7 @@ def _flash_attn_fwd(
     mask_mod: Optional[Callable] = None,
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     return_lse: bool = False,
-    return_max_norm: bool = False,
+    return_max_logit: bool = False,
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
     aux_tensors: Optional[list[torch.Tensor]] = None,
@@ -442,12 +442,12 @@ def _flash_attn_fwd(
     elif lse is not None:
         _validate_tensor(lse, "lse", lse_shape, torch.float32, device)
 
-    if return_max_norm:
+    if return_max_logit:
         if page_table is not None:
-            raise ValueError("return_max_norm is not supported with paged KV cache (inference)")
+            raise ValueError("return_max_logit is not supported with paged KV cache (inference)")
         if pack_gqa:
-            raise ValueError("return_max_norm is not supported with pack_gqa")
-    max_norm = torch.full((1,), float("-inf"), dtype=torch.float32, device=device) if return_max_norm else None
+            raise ValueError("return_max_logit is not supported with pack_gqa")
+    max_logit = torch.full((1,), float("-inf"), dtype=torch.float32, device=device) if return_max_logit else None
 
     dtype = torch2cute_dtype_map[q.dtype]
     use_block_sparsity = block_sparse_tensors is not None
@@ -634,7 +634,7 @@ def _flash_attn_fwd(
         intra_wg_overlap,
         requested_use_clc_scheduler,
         fa_logging.get_fa_log_level(),
-        max_norm is None or pack_gqa,  # kernel receives max_norm?
+        max_logit is None or pack_gqa,  # kernel receives max_logit?
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
         (
@@ -665,10 +665,10 @@ def _flash_attn_fwd(
             lse_tensor = None
 
         # Kernel computes max logit only for non-pack_gqa paths
-        _kernel_max_norm = max_norm if (max_norm is not None and not pack_gqa) else None
-        max_norm_tensor = (
-            to_cute_tensor(_kernel_max_norm, assumed_align=4, leading_dim=0)
-            if _kernel_max_norm is not None
+        _kernel_max_logit = max_logit if (max_logit is not None and not pack_gqa) else None
+        max_logit_tensor = (
+            to_cute_tensor(_kernel_max_logit, assumed_align=4, leading_dim=0)
+            if _kernel_max_logit is not None
             else None
         )
 
@@ -796,7 +796,7 @@ def _flash_attn_fwd(
             learnable_sink_tensor,
             sparse_tensors,
             cute_aux_tensors,
-            max_norm_tensor,
+            max_logit_tensor,
             current_stream,
             options="--enable-tvm-ffi",
         )
@@ -823,7 +823,7 @@ def _flash_attn_fwd(
             learnable_sink,
             normalized_block_sparse_tensors[:4] if normalized_block_sparse_tensors is not None else None,
             aux_tensors,
-            max_norm if not pack_gqa else None,
+            max_logit if not pack_gqa else None,
         )
     if is_split_kv:
         _flash_attn_fwd_combine(
@@ -834,8 +834,8 @@ def _flash_attn_fwd(
             cu_seqlens_q,
             seqused_q,
         )
-    if return_max_norm:
-        return out, lse, max_norm
+    if return_max_logit:
+        return out, lse, max_logit
     return out, lse
 
 
@@ -1608,7 +1608,7 @@ class FlashAttnFunc(torch.autograd.Function):
         mask_block_idx: Optional[torch.Tensor] = None,
         block_size: Optional[Tuple[int, int]] = None,
         return_lse: bool = False,
-        return_max_norm: bool = False,
+        return_max_logit: bool = False,
     ):
         # Only create block sparse tensors if at least one block sparse parameter is provided
         block_sparse_tensors = None
@@ -1635,13 +1635,13 @@ class FlashAttnFunc(torch.autograd.Function):
             mask_mod=mask_mod,
             block_sparse_tensors=block_sparse_tensors,
             return_lse=return_lse,
-            return_max_norm=return_max_norm,
+            return_max_logit=return_max_logit,
         )
-        if return_max_norm:
-            out, lse, max_norm = fwd_result
+        if return_max_logit:
+            out, lse, max_logit = fwd_result
         else:
             out, lse = fwd_result
-            max_norm = None
+            max_logit = None
         ctx.save_for_backward(q, k, v, out, lse)
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
@@ -1650,12 +1650,12 @@ class FlashAttnFunc(torch.autograd.Function):
         ctx.deterministic = deterministic
         ctx.return_lse = return_lse
         ctx.set_materialize_grads(False)
-        if max_norm is not None:
-            ctx.mark_non_differentiable(max_norm)
-        return out, lse, max_norm
+        if max_logit is not None:
+            ctx.mark_non_differentiable(max_logit)
+        return out, lse, max_logit
 
     @staticmethod
-    def backward(ctx, dout, dlse, dmax_norm):
+    def backward(ctx, dout, dlse, dmax_logit):
         q, k, v, out, lse = ctx.saved_tensors
         if not ctx.return_lse:
             dlse = None
@@ -1704,7 +1704,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         score_mod: Optional[Callable] = None,
         aux_tensors: Optional[list] = None,
         return_lse: bool = False,
-        return_max_norm: bool = False,
+        return_max_logit: bool = False,
     ):
         fwd_result = _flash_attn_fwd(
             q,
@@ -1728,13 +1728,13 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             score_mod=score_mod,
             aux_tensors=aux_tensors,
             return_lse=return_lse,
-            return_max_norm=return_max_norm,
+            return_max_logit=return_max_logit,
         )
-        if return_max_norm:
-            out, lse, max_norm = fwd_result
+        if return_max_logit:
+            out, lse, max_logit = fwd_result
         else:
             out, lse = fwd_result
-            max_norm = None
+            max_logit = None
         ctx.save_for_backward(q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
@@ -1745,12 +1745,12 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         ctx.max_seqlen_k = max_seqlen_k
         ctx.return_lse = return_lse
         ctx.set_materialize_grads(False)
-        if max_norm is not None:
-            ctx.mark_non_differentiable(max_norm)
-        return out, lse, max_norm
+        if max_logit is not None:
+            ctx.mark_non_differentiable(max_logit)
+        return out, lse, max_logit
 
     @staticmethod
-    def backward(ctx, dout, dlse, dmax_norm):
+    def backward(ctx, dout, dlse, dmax_logit):
         q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = ctx.saved_tensors
         assert ctx.softcap == 0.0
         if not ctx.return_lse:
@@ -1801,7 +1801,7 @@ def flash_attn_func(
     mask_block_idx: Optional[torch.Tensor] = None,
     block_size: Optional[Tuple[int, int]] = None,
     return_lse: bool = False,
-    return_max_norm: bool = False,
+    return_max_logit: bool = False,
 ):
     result = FlashAttnFunc.apply(
         q,
@@ -1822,10 +1822,10 @@ def flash_attn_func(
         mask_block_idx,
         block_size,
         return_lse,
-        return_max_norm,
+        return_max_logit,
     )
-    if return_max_norm:
-        return result  # (out, lse, max_norm)
+    if return_max_logit:
+        return result  # (out, lse, max_logit)
     return result[0], result[1]  # (out, lse)
 
 
@@ -1851,7 +1851,7 @@ def flash_attn_varlen_func(
     score_mod: Optional[Callable] = None,
     aux_tensors: Optional[list] = None,
     return_lse: bool = False,
-    return_max_norm: bool = False,
+    return_max_logit: bool = False,
 ):
     result = FlashAttnVarlenFunc.apply(
         q,
@@ -1875,10 +1875,10 @@ def flash_attn_varlen_func(
         score_mod,
         aux_tensors,
         return_lse,
-        return_max_norm,
+        return_max_logit,
     )
-    if return_max_norm:
-        return result  # (out, lse, max_norm)
+    if return_max_logit:
+        return result  # (out, lse, max_logit)
     return result[0], result[1]  # (out, lse)
 
 

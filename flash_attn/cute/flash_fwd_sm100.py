@@ -352,7 +352,7 @@ class FlashAttentionForwardSm100:
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors: Optional[list] = None,
-        mMaxNorm: Optional[cute.Tensor] = None,
+        mMaxLogit: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -720,7 +720,7 @@ class FlashAttentionForwardSm100:
             aux_tensors,
             fastdiv_mods,
             head_divmod,
-            mMaxNorm,
+            mMaxLogit,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -767,7 +767,7 @@ class FlashAttentionForwardSm100:
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
         head_divmod=None,
-        mMaxNorm: Optional[cute.Tensor] = None,
+        mMaxLogit: Optional[cute.Tensor] = None,
     ):
         """The device kernel implementation of the Fused Multi-Head Attention.
 
@@ -783,9 +783,9 @@ class FlashAttentionForwardSm100:
         computation phases, and optional attention masking.
         """
 
-        # Store mMaxNorm on self before warp branching (CuTeDSL kernel params
+        # Store mMaxLogit on self before warp branching (CuTeDSL kernel params
         # aren't accessible in deeply nested warp-selection branches)
-        self._mMaxNorm = mMaxNorm
+        self._mMaxLogit = mMaxLogit
 
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
@@ -2490,9 +2490,9 @@ class FlashAttentionForwardSm100:
                     m_tile_idx = (m_block * self.q_stage + stage) * self.cta_group_size + mma_tile_coord_v
                     row_sum, row_max, acc_O_mn_row_is_zero_or_nan = stats[stage]
                     # Write max logit from correction warps
-                    if const_expr(self._mMaxNorm is not None and row_max is not None):
+                    if const_expr(self._mMaxLogit is not None and row_max is not None):
                         if not acc_O_mn_row_is_zero_or_nan:
-                            utils.atomic_max_fp32(row_max, self._mMaxNorm.iterator)
+                            utils.atomic_max_fp32(row_max, self._mMaxLogit.iterator)
                     LN2 = math.log(2.0)
                     lse = (
                         (row_max * softmax_scale_log2 + cute.math.log2(row_sum, fastmath=True)) * LN2

@@ -1710,7 +1710,7 @@ def test_flash_attn_invalid_head_dim(head_dim):
 @pytest.mark.parametrize("d", [64, 128])
 @pytest.mark.parametrize("seqlen_q,seqlen_k", [(128, 128), (256, 512)])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_flash_attn_max_norm(
+def test_flash_attn_max_logit(
     seqlen_q,
     seqlen_k,
     d,
@@ -1732,7 +1732,7 @@ def test_flash_attn_max_norm(
     v = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype)
 
     out, lse, max_logit = flash_attn_func(
-        q, k, v, causal=causal, return_lse=True, return_max_norm=True,
+        q, k, v, causal=causal, return_lse=True, return_max_logit=True,
     )
 
     if not USE_FAKE_TENSOR:
@@ -1755,6 +1755,6 @@ def test_flash_attn_max_norm(
         assert max_logit.item() <= max_logit_ref.item() * 1.01, "kernel should not exceed ref"
         assert max_logit.item() >= max_logit_ref.item() * 0.85, "kernel should be within 15% of ref"
 
-    # Also test that return_max_norm=False returns 2-tuple (backward compat)
-    result = flash_attn_func(q, k, v, causal=causal, return_max_norm=False)
+    # Also test that return_max_logit=False returns 2-tuple (backward compat)
+    result = flash_attn_func(q, k, v, causal=causal, return_max_logit=False)
     assert len(result) == 2

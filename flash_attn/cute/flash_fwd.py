@@ -631,7 +631,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors=None,
-        mMaxNorm: Optional[cute.Tensor] = None,
+        mMaxLogit: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -729,7 +729,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             TileScheduler,
             aux_tensors,
             fastdiv_mods,
-            mMaxNorm,
+            mMaxLogit,
         ).launch(
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
@@ -769,9 +769,9 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         TileScheduler: cutlass.Constexpr[Callable],
         aux_tensors=None,
         fastdiv_mods=None,
-        mMaxNorm: Optional[cute.Tensor] = None,
+        mMaxLogit: Optional[cute.Tensor] = None,
     ):
-        self._mMaxNorm = mMaxNorm
+        self._mMaxLogit = mMaxLogit
 
         # Thread index, block index
         tidx, _, _ = cute.arch.thread_idx()
@@ -1059,8 +1059,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         softmax.rescale_O(acc_O, row_scale)
 
         # Write max logit to global memory
-        if const_expr(self._mMaxNorm is not None):
-            utils.write_max_logit(softmax.row_max, self._mMaxNorm)
+        if const_expr(self._mMaxLogit is not None):
+            utils.write_max_logit(softmax.row_max, self._mMaxLogit)
 
         # ///////////////////////////////////////////////////////////////////////////////
         # Epilogue
