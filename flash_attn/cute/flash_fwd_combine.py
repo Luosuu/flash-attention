@@ -199,6 +199,7 @@ class FlashAttentionForwardCombine:
         num_splits_dynamic_ptr: Optional[cute.Tensor] = None,
         varlen_batch_idx: Optional[cute.Tensor] = None,
         semaphore_to_reset: Optional[cute.Tensor] = None,
+        mMaxNorm: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -303,6 +304,7 @@ class FlashAttentionForwardCombine:
             num_splits_dynamic_ptr,
             varlen_batch_idx,
             semaphore_to_reset,
+            mMaxNorm,
             SharedStorage,
             self.smem_layout_lse,
             self.smem_layout_o,
@@ -332,6 +334,7 @@ class FlashAttentionForwardCombine:
         num_splits_dynamic_ptr: Optional[cute.Tensor],
         varlen_batch_idx: Optional[cute.Tensor],
         semaphore_to_reset: Optional[cute.Tensor],
+        mMaxNorm: Optional[cute.Tensor],
         SharedStorage: cutlass.Constexpr,
         smem_layout_lse: cute.Layout | cute.ComposedLayout,
         smem_layout_o: cute.Layout,
@@ -637,6 +640,12 @@ class FlashAttentionForwardCombine:
                             tOrO[None, m, None].load()
                             + scale[m] * tOrO_partial[None, m, None].load().to(Float32)
                         )
+
+            # ===============================
+            # Step 6.5: Compute amax for max_norm
+            # ===============================
+            if const_expr(mMaxNorm is not None):
+                utils.write_max_norm(tOrO, mMaxNorm)
 
             # ===============================
             # Step 7: Write final O to gmem

@@ -313,10 +313,11 @@ def _flash_attn_fwd(
     mask_mod: Optional[Callable] = None,
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     return_lse: bool = False,
+    return_max_norm: bool = False,
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
     aux_tensors: Optional[list[torch.Tensor]] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """Forward pass for FlashAttention.
 
     Args:
@@ -440,6 +441,13 @@ def _flash_attn_fwd(
         )
     elif lse is not None:
         _validate_tensor(lse, "lse", lse_shape, torch.float32, device)
+
+    if return_max_norm:
+        if page_table is not None:
+            raise ValueError("return_max_norm is not supported with paged KV cache (inference)")
+        if pack_gqa:
+            raise ValueError("return_max_norm is not supported with pack_gqa")
+    max_norm = torch.zeros(1, dtype=torch.float32, device=device) if return_max_norm else None
 
     dtype = torch2cute_dtype_map[q.dtype]
     use_block_sparsity = block_sparse_tensors is not None
@@ -626,6 +634,7 @@ def _flash_attn_fwd(
         intra_wg_overlap,
         requested_use_clc_scheduler,
         fa_logging.get_fa_log_level(),
+        max_norm is None or is_split_kv or pack_gqa,  # kernel receives max_norm?
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
         (
@@ -654,6 +663,14 @@ def _flash_attn_fwd(
             lse_tensor = to_cute_tensor(lse, assumed_align=4)
         else:
             lse_tensor = None
+
+        # Kernel computes max_norm only for non-split, non-pack_gqa paths
+        _kernel_max_norm = max_norm if (max_norm is not None and not is_split_kv and not pack_gqa) else None
+        max_norm_tensor = (
+            to_cute_tensor(_kernel_max_norm, assumed_align=4, leading_dim=0)
+            if _kernel_max_norm is not None
+            else None
+        )
 
         sparse_tensors = None
         if normalized_block_sparse_tensors is not None:
@@ -779,6 +796,7 @@ def _flash_attn_fwd(
             learnable_sink_tensor,
             sparse_tensors,
             cute_aux_tensors,
+            max_norm_tensor,
             current_stream,
             options="--enable-tvm-ffi",
         )
@@ -805,6 +823,7 @@ def _flash_attn_fwd(
             learnable_sink,
             normalized_block_sparse_tensors[:4] if normalized_block_sparse_tensors is not None else None,
             aux_tensors,
+            max_norm if not is_split_kv and not pack_gqa else None,
         )
     if is_split_kv:
         _flash_attn_fwd_combine(
@@ -814,7 +833,10 @@ def _flash_attn_fwd(
             lse.transpose(-1, -2) if lse is not None else None,
             cu_seqlens_q,
             seqused_q,
+            max_norm=max_norm,
         )
+    if return_max_norm:
+        return out, lse, max_norm
     return out, lse
 
 
@@ -1587,6 +1609,7 @@ class FlashAttnFunc(torch.autograd.Function):
         mask_block_idx: Optional[torch.Tensor] = None,
         block_size: Optional[Tuple[int, int]] = None,
         return_lse: bool = False,
+        return_max_norm: bool = False,
     ):
         # Only create block sparse tensors if at least one block sparse parameter is provided
         block_sparse_tensors = None
@@ -1598,7 +1621,7 @@ class FlashAttnFunc(torch.autograd.Function):
                 mask_block_idx=mask_block_idx,
                 block_size=block_size,
             )
-        out, lse = _flash_attn_fwd(
+        fwd_result = _flash_attn_fwd(
             q,
             k,
             v,
@@ -1613,7 +1636,13 @@ class FlashAttnFunc(torch.autograd.Function):
             mask_mod=mask_mod,
             block_sparse_tensors=block_sparse_tensors,
             return_lse=return_lse,
+            return_max_norm=return_max_norm,
         )
+        if return_max_norm:
+            out, lse, max_norm = fwd_result
+        else:
+            out, lse = fwd_result
+            max_norm = None
         ctx.save_for_backward(q, k, v, out, lse)
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
@@ -1622,10 +1651,12 @@ class FlashAttnFunc(torch.autograd.Function):
         ctx.deterministic = deterministic
         ctx.return_lse = return_lse
         ctx.set_materialize_grads(False)
-        return out, lse
+        if max_norm is not None:
+            ctx.mark_non_differentiable(max_norm)
+        return out, lse, max_norm
 
     @staticmethod
-    def backward(ctx, dout, dlse):
+    def backward(ctx, dout, dlse, dmax_norm):
         q, k, v, out, lse = ctx.saved_tensors
         if not ctx.return_lse:
             dlse = None
@@ -1674,8 +1705,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         score_mod: Optional[Callable] = None,
         aux_tensors: Optional[list] = None,
         return_lse: bool = False,
+        return_max_norm: bool = False,
     ):
-        out, lse = _flash_attn_fwd(
+        fwd_result = _flash_attn_fwd(
             q,
             k,
             v,
@@ -1697,7 +1729,13 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             score_mod=score_mod,
             aux_tensors=aux_tensors,
             return_lse=return_lse,
+            return_max_norm=return_max_norm,
         )
+        if return_max_norm:
+            out, lse, max_norm = fwd_result
+        else:
+            out, lse = fwd_result
+            max_norm = None
         ctx.save_for_backward(q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
@@ -1708,10 +1746,12 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         ctx.max_seqlen_k = max_seqlen_k
         ctx.return_lse = return_lse
         ctx.set_materialize_grads(False)
-        return out, lse
+        if max_norm is not None:
+            ctx.mark_non_differentiable(max_norm)
+        return out, lse, max_norm
 
     @staticmethod
-    def backward(ctx, dout, dlse):
+    def backward(ctx, dout, dlse, dmax_norm):
         q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = ctx.saved_tensors
         assert ctx.softcap == 0.0
         if not ctx.return_lse:
@@ -1762,8 +1802,9 @@ def flash_attn_func(
     mask_block_idx: Optional[torch.Tensor] = None,
     block_size: Optional[Tuple[int, int]] = None,
     return_lse: bool = False,
+    return_max_norm: bool = False,
 ):
-    return FlashAttnFunc.apply(
+    result = FlashAttnFunc.apply(
         q,
         k,
         v,
@@ -1782,7 +1823,11 @@ def flash_attn_func(
         mask_block_idx,
         block_size,
         return_lse,
+        return_max_norm,
     )
+    if return_max_norm:
+        return result  # (out, lse, max_norm)
+    return result[0], result[1]  # (out, lse)
 
 
 def flash_attn_varlen_func(
@@ -1807,8 +1852,9 @@ def flash_attn_varlen_func(
     score_mod: Optional[Callable] = None,
     aux_tensors: Optional[list] = None,
     return_lse: bool = False,
+    return_max_norm: bool = False,
 ):
-    return FlashAttnVarlenFunc.apply(
+    result = FlashAttnVarlenFunc.apply(
         q,
         k,
         v,
@@ -1830,12 +1876,16 @@ def flash_attn_varlen_func(
         score_mod,
         aux_tensors,
         return_lse,
+        return_max_norm,
     )
+    if return_max_norm:
+        return result  # (out, lse, max_norm)
+    return result[0], result[1]  # (out, lse)
 
 
 def _compile_fwd_combine(
     dtype, dtype_partial, head_dim, tile_m, k_block_size, log_max_splits,
-    has_cu_seqlens, has_seqused, has_lse, has_varlen_batch_idx,
+    has_cu_seqlens, has_seqused, has_lse, has_varlen_batch_idx, has_max_norm=False,
 ):
     """Compile fwd combine kernel using cute fake tensors (no real GPU tensors needed)."""
     sym = cute.sym_int
@@ -1880,11 +1930,13 @@ def _compile_fwd_combine(
     mNumSplitsDynamic = None  # Not parametrized in compile_key
     mVarlenBatchIdx = fake_tensor(Int32, (batch_for_1d,), divisibility=1) if has_varlen_batch_idx else None
     mSemaphore = None  # Not parametrized in compile_key
+    mMaxNorm = fake_tensor(Float32, (1,), divisibility=1) if has_max_norm else None
 
     return cute.compile(
         fa_combine,
         mO_partial, mLSE_partial, mO, mLSE,
         mCuSeqlens, mSeqused, mNumSplitsDynamic, mVarlenBatchIdx, mSemaphore,
+        mMaxNorm,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--enable-tvm-ffi",
     )
@@ -1900,6 +1952,7 @@ def _flash_attn_fwd_combine(
     num_splits_dynamic_ptr: Optional[torch.Tensor] = None,
     varlen_batch_idx: Optional[torch.Tensor] = None,
     semaphore_to_reset: Optional[torch.Tensor] = None,
+    max_norm: Optional[torch.Tensor] = None,
 ) -> None:
     """Forward combine kernel for split attention computation.
 
@@ -1968,6 +2021,7 @@ def _flash_attn_fwd_combine(
         seqused is not None,
         lse is not None,
         varlen_batch_idx is not None,
+        max_norm is not None,
     )
     if compile_key not in _flash_attn_fwd_combine.compile_cache:
         _flash_attn_fwd_combine.compile_cache[compile_key] = _compile_fwd_combine(
@@ -1977,7 +2031,7 @@ def _flash_attn_fwd_combine(
         _flash_attn_fwd_combine.compile_cache[compile_key](
             out_partial, lse_partial, out, lse,
             cu_seqlens, seqused, num_splits_dynamic_ptr, varlen_batch_idx,
-            semaphore_to_reset,
+            semaphore_to_reset, max_norm,
         )
 
 

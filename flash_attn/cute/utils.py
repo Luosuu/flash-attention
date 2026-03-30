@@ -424,6 +424,55 @@ def atomic_add_fp32(a: float | Float32, gmem_ptr: cute.Pointer, *, loc=None, ip=
 
 
 @dsl_user_op
+def atomic_max_fp32(a: float | Float32, gmem_ptr: cute.Pointer, *, loc=None, ip=None) -> None:
+    """Atomic max for non-negative float32 using int32 bit-cast trick.
+
+    Non-negative IEEE 754 floats preserve ordering when reinterpreted as int32,
+    so atom.global.max.s32 on the bit-cast value works correctly for abs values.
+    """
+    gmem_ptr_i64 = gmem_ptr.toint(loc=loc, ip=ip).ir_value()
+    # Bitcast float to int32 via LLVM, then pass as integer to PTX
+    a_ir = Float32(a).ir_value(loc=loc, ip=ip)
+    a_i32 = llvm.bitcast(T.i32(), a_ir, loc=loc, ip=ip)
+    # atom.global.max.s32 returns old value; must capture it even if unused
+    llvm.inline_asm(
+        T.i32(),
+        [gmem_ptr_i64, a_i32],
+        "atom.global.max.s32 $0, [$1], $2;",
+        "=r,l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@cute.jit
+def _max_op(a: Float32, b: Float32) -> Float32:
+    return a if a > b else b
+
+
+@cute.jit
+def compute_local_amax(x: cute.Tensor) -> Float32:
+    """Compute max(abs(x)) over all elements of a register-resident tensor."""
+    local_max = Float32(0.0)
+    for i in cutlass.range_constexpr(cute.size(x)):
+        val = Float32(x[i])
+        val = -val if val < 0.0 else val
+        local_max = val if val > local_max else local_max
+    return local_max
+
+
+@cute.jit
+def write_max_norm(acc_O: cute.Tensor, mMaxNorm: cute.Tensor) -> None:
+    """Compute amax of acc_O and atomically update mMaxNorm via warp reduction."""
+    local_max = compute_local_amax(acc_O)
+    local_max = warp_reduce(local_max, _max_op)
+    lane_id = cute.arch.thread_idx()[0] % cute.arch.WARP_SIZE
+    if lane_id == 0:
+        atomic_max_fp32(local_max, mMaxNorm.iterator)
+
+
+@dsl_user_op
 def elem_pointer(x: cute.Tensor, coord: cute.Coord, *, loc=None, ip=None) -> cute.Pointer:
     return x.iterator + cute.crd2idx(coord, x.layout, loc=loc, ip=ip)
 

@@ -336,7 +336,11 @@ class FlashAttentionForwardBase:
         m_block: Int32,
         head_idx: Int32,
         batch_idx: Int32,
+        mMaxNorm: Optional[cute.Tensor] = None,
     ):
+        # Compute amax before dtype conversion (acc_O is still float32)
+        if const_expr(mMaxNorm is not None):
+            utils.write_max_norm(acc_O, mMaxNorm)
         # store acc_O
         rO = cute.make_fragment_like(acc_O, self.dtype)
         rO.store(acc_O.load().to(self.dtype))
@@ -631,6 +635,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors=None,
+        mMaxNorm: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -728,6 +733,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             TileScheduler,
             aux_tensors,
             fastdiv_mods,
+            mMaxNorm,
         ).launch(
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
@@ -767,7 +773,10 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         TileScheduler: cutlass.Constexpr[Callable],
         aux_tensors=None,
         fastdiv_mods=None,
+        mMaxNorm: Optional[cute.Tensor] = None,
     ):
+        self._mMaxNorm = mMaxNorm
+
         # Thread index, block index
         tidx, _, _ = cute.arch.thread_idx()
 
@@ -1072,6 +1081,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             m_block,
             num_head,
             batch_size,
+            self._mMaxNorm,
         )
 
     @cute.jit

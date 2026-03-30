@@ -1702,3 +1702,52 @@ def test_flash_attn_invalid_head_dim(head_dim):
 
     with pytest.raises(AssertionError, match=re.escape(f"(head_dim, head_dim_v)=({head_dim}, {head_dim}) is not supported on SM")):
         flash_attn_func(q, k, v)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("mha_type", ["mha"])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("seqlen_q,seqlen_k", [(128, 128), (256, 512)])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_max_norm(
+    seqlen_q,
+    seqlen_k,
+    d,
+    causal,
+    mha_type,
+    dtype,
+):
+    device = "cuda"
+    seed = 42
+    random.seed(seed)
+    torch.random.manual_seed(seed)
+    torch.cuda.empty_cache()
+    batch_size = 4
+    nheads = 6
+    nheads_kv = nheads if mha_type == "mha" else 2
+
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype)
+    k = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype)
+    v = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype)
+
+    out, lse, max_norm = flash_attn_func(
+        q, k, v, causal=causal, return_lse=True, return_max_norm=True,
+    )
+
+    if not USE_FAKE_TENSOR:
+        assert max_norm is not None
+        assert max_norm.shape == (1,)
+        assert max_norm.dtype == torch.float32
+
+        max_norm_ref = torch.abs(out.float()).max()
+        print(f"max_norm={max_norm.item():.6f}, max_norm_ref={max_norm_ref.item():.6f}")
+        # Kernel computes amax from float32 registers before dtype conversion;
+        # reference computes from the already-converted output. The difference
+        # is bounded by dtype quantization error.
+        tol = 1e-3 if dtype == torch.float16 else 5e-3
+        torch.testing.assert_close(max_norm, max_norm_ref.unsqueeze(0), rtol=tol, atol=tol)
+
+    # Also test that return_max_norm=False returns 2-tuple (backward compat)
+    result = flash_attn_func(q, k, v, causal=causal, return_max_norm=False)
+    assert len(result) == 2

@@ -352,6 +352,7 @@ class FlashAttentionForwardSm100:
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors: Optional[list] = None,
+        mMaxNorm: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -719,6 +720,7 @@ class FlashAttentionForwardSm100:
             aux_tensors,
             fastdiv_mods,
             head_divmod,
+            mMaxNorm,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -765,6 +767,7 @@ class FlashAttentionForwardSm100:
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
         head_divmod=None,
+        mMaxNorm: Optional[cute.Tensor] = None,
     ):
         """The device kernel implementation of the Fused Multi-Head Attention.
 
@@ -779,6 +782,10 @@ class FlashAttentionForwardSm100:
         using tensor memory access (TMA) for efficient data loading, warp specialization for different
         computation phases, and optional attention masking.
         """
+
+        # Store mMaxNorm on self before warp branching (CuTeDSL kernel params
+        # aren't accessible in deeply nested warp-selection branches)
+        self._mMaxNorm = mMaxNorm
 
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
@@ -2412,6 +2419,7 @@ class FlashAttentionForwardSm100:
                         mO_cur,
                         gO_stage,
                         gmem_tiled_copy_O,
+                        self._mMaxNorm,
                     )
                     # Signal for the next work tile that O buffers in tmem are already read, so
                     # mma warp can write to them
@@ -2583,6 +2591,7 @@ class FlashAttentionForwardSm100:
         mO_cur: Optional[cute.Tensor] = None,
         gO: Optional[cute.Tensor] = None,
         gmem_tiled_copy_O: Optional[cute.TiledCopy] = None,
+        mMaxNorm: Optional[cute.Tensor] = None,
     ):
         """Apply final scaling and transformation to attention output before writing to global memory.
 
@@ -2635,6 +2644,8 @@ class FlashAttentionForwardSm100:
         tOtO_t2r = thr_tmem_load.partition_S(tOtO_i[(None, None), None])
         tOsO_s2r = copy_utils.partition_D_position_independent(thr_tmem_load, tOsO_i[(None, None), None])
         tOcO_t2r = thr_tmem_load.partition_D(tOcO_i[(None, None), None])
+        if const_expr(mMaxNorm is not None):
+            amax_local = Float32(0.0)
         for i in cutlass.range(self.head_dim_v_padded // corr_tile_size, unroll_full=True):
             tOtO_t2r_i = tOtO_t2r[None, 0, 0, i]
             tOsO_r2s_i = tOsO_s2r[None, 0, 0, i]
@@ -2644,7 +2655,15 @@ class FlashAttentionForwardSm100:
                 tOrO_frg[j], tOrO_frg[j + 1] = cute.arch.mul_packed_f32x2(
                     (tOrO_frg[j], tOrO_frg[j + 1]), (scale, scale)
                 )
+            if const_expr(mMaxNorm is not None):
+                tile_max = utils.compute_local_amax(tOrO_frg)
+                amax_local = tile_max if tile_max > amax_local else amax_local
             copy_utils.cvt_copy(tiled_smem_store, tOrO_frg, tOsO_r2s_i)
+        if const_expr(mMaxNorm is not None):
+            amax_local = utils.warp_reduce(amax_local, utils._max_op)
+            lane_id = cute.arch.thread_idx()[0] % cute.arch.WARP_SIZE
+            if lane_id == 0:
+                utils.atomic_max_fp32(amax_local, mMaxNorm.iterator)
         cute.arch.fence_view_async_shared()
 
         if const_expr(self.use_correction_warps_for_epi):
